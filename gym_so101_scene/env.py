@@ -43,7 +43,7 @@ class So101SceneEnv(gym.Env):
         self._scene_root = (
             Path(scene_root)
             if scene_root is not None
-            else Path(__file__).resolve().parents[1] / "assets" / "SO101"
+            else Path(__file__).resolve().parents[2] / "scene" / "assets" / "SO101"
         )
         self._max_episode_steps = max_episode_steps
         self._action_scale = action_scale

@@ -9,16 +9,16 @@ import gymnasium as gym
 import numpy as np
 from PIL import Image
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-LEROBOT_SRC = REPO_ROOT / "lerobot" / "src"
-if str(LEROBOT_SRC) not in sys.path:
+PROJECT_ROOT = Path(__file__).resolve().parent
+PARENT_ROOT = PROJECT_ROOT.parent
+LEROBOT_SRC = PARENT_ROOT / "lerobot" / "src"
+if LEROBOT_SRC.exists() and str(LEROBOT_SRC) not in sys.path:
     sys.path.insert(0, str(LEROBOT_SRC))
 
-SCENE_ROOT = Path(__file__).resolve().parent
-if str(SCENE_ROOT) not in sys.path:
-    sys.path.insert(0, str(SCENE_ROOT))
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-import gym_so101_scene  # noqa: F401  (ensures env registration)
+import gym_so101_scene  # noqa: F401
 from lerobot.envs.factory import make_env_config
 
 
@@ -41,7 +41,8 @@ def rollout(args: argparse.Namespace) -> None:
     record_root = Path(args.record_dir).resolve()
     record_root.mkdir(parents=True, exist_ok=True)
     for episode in range(args.episodes):
-        obs, info = env.reset(seed=args.seed + episode if args.seed is not None else None)
+        seed = args.seed + episode if args.seed is not None else None
+        obs, info = env.reset(seed=seed)
         done = False
         step_idx = 0
         episode_dir = record_root / f"episode_{episode:03d}"
@@ -55,15 +56,15 @@ def rollout(args: argparse.Namespace) -> None:
             step_idx += 1
             done = terminated or truncated
         print(
-            f"Episode {episode} -> success={info.get('success', False)} distance={info.get('distance', np.nan):.3f}"
+            f"Episode {episode} -> success={info.get('success', False)} "
+            f"distance={info.get('distance', np.nan):.3f}"
         )
     env.close()
-    print(
-        "Frames saved under",
-        record_root,
-        "\nExample: ffmpeg -y -framerate 30 -pattern_type glob -i '"
-        f"{record_root}/episode_000/front/*.png' {record_root}/episode_000_front.mp4",
+    example = (
+        "ffmpeg -y -framerate 30 -pattern_type glob -i '"
+        f"{record_root}/episode_000/front/*.png' {record_root}/episode_000_front.mp4"
     )
+    print("Frames saved under", record_root, "\nExample:", example)
 
 
 def parse_args() -> argparse.Namespace:

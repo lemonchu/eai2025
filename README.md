@@ -1,20 +1,4 @@
-The provided scripts are about real robot.
-
-- robot.py: Tests the loading of the SO-101 simulation and the wrist camera setup.
-
-- front_camera.py: Defines the front camera settings within the simulation.
-
-- calibration.py: Determines the intrinsic parameters for the real robot's front camera.
-
-- undistort.py: Corrects distortion and analyzes images taken by the real robot.
-
-- distort.py: Adds distortion to the simulated pinhole camera model.
-
-- robots: Stores joint calibration parameters for mapping between the real robot and the simulation.
-
-- dummy_eval.py: Serves as a reference interface for real robot testing.
-
-**These scripts are provided only for context and reference. You are free to choose any algorithms, simulation methods, or platforms for your actual work.**
+For details about the legacy real-robot helper scripts, see `scene/README.md`.
 
 ## New: LeRobot-ready SO-101 scene
 
@@ -22,8 +6,8 @@ The provided scripts are about real robot.
 - `run_so101_lerobot_demo.py`: Uses `lerobot.envs.factory.make_env_config` to instantiate the scene, roll out random actions, and save RGB frames. Example (headless):
 
 	```bash
-	cd /cephfs/hp/cm_projects/eai
-	PYOPENGL_PLATFORM=egl python scene/run_so101_lerobot_demo.py --episodes 3 --record-dir outputs/so101_demo
+	cd /cephfs/hp/cm_projects/eai/eai2025
+	PYOPENGL_PLATFORM=egl python run_so101_lerobot_demo.py --episodes 3 --record-dir outputs/so101_demo
 	```
 
 	Each episode folder contains `front/` and `wrist/` PNGs. Convert to MP4 with
