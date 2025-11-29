@@ -7,17 +7,20 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 import sapien
+from PIL import Image
 from gymnasium import spaces
-from sapien.pysapien.render import RenderCameraComponent
+from sapien.render import RenderCameraComponent
 
 from .layout import TableLayout, spawn_layout
 
 
+# CameraSpec: width/height/fovy
 @dataclass
 class CameraSpec:
-    width: int = 960
-    height: int = 720
-    fovx_deg: float = 125.0
+    width: int = 640
+    height: int = 480
+    fovx_deg: float = 117.12
+    fovy_deg: float = 73.63
     near: float = 0.01
     far: float = 5.0
 
@@ -33,8 +36,6 @@ class CameraSpec:
     def fovy_rad(self) -> float:
         # Derive the vertical FOV from the horizontal one to avoid stretched renders.
         return 2.0 * np.arctan(np.tan(self.fovx_rad / 2.0) / self.aspect_ratio)
-
-
 @dataclass
 class ArmInterface:
     name: str
@@ -45,8 +46,7 @@ class ArmInterface:
     initial_qpos: np.ndarray
     eef_link: sapien.Link
     camera_link: sapien.Link
-
-
+    
 class So101SceneEnv(gym.Env):
     """Minimal Sapien-based SO-101 scene compatible with LeRobot policies."""
 
@@ -60,6 +60,7 @@ class So101SceneEnv(gym.Env):
         max_episode_steps: int = 200,
         action_scale: float = 0.05,
         success_radius: float = 0.035,
+        task: str | None = None,
     ) -> None:
         super().__init__()
         self._render_mode = render_mode
@@ -76,6 +77,10 @@ class So101SceneEnv(gym.Env):
         self._camera_spec = CameraSpec()
         self._layout = TableLayout()
         self._layout_actors: dict[str, list[Any]] | None = None
+        # Task controls which objects are spawned on reset: 'lift', 'stack', 'sort' or None
+        self._task = task
+        self._task_objects: list[sapien.Actor] = []
+        self._object_half = 0.015
         self._controlled_joint_names = [
             "shoulder_pan",
             "shoulder_lift",
@@ -97,10 +102,64 @@ class So101SceneEnv(gym.Env):
     def _setup_scene(self) -> None:
         self.scene = sapien.Scene()
         self.scene.set_timestep(1 / 240)
-        self.scene.add_ground(0)
-        self.scene.set_ambient_light([0.4, 0.4, 0.4])
-        self.scene.add_directional_light([0.3, -1, -1], [2.5, 2.5, 2.5], shadow=True)
-        self.scene.add_directional_light([-0.5, 1, -1], [1.5, 1.5, 1.5], shadow=False)
+        # Ground material: use a soft, slightly warm/gray base instead of pure white
+        try:
+            ground_material = sapien.render.RenderMaterial()
+            # Try to load ground albedo and roughness maps from the scene assets directory.
+            # Fixed paths under the scene assets directory:
+            #   ./ground_albedo.png
+            #   ./ground_roughness.png
+            # Get current folder   
+            current_folder = Path(__file__).parent
+            albedo_path =  current_folder / "textures/tiles.png"
+            roughness_path = current_folder / "textures/ground_texture.jpg"
+            print("Loading ground textures from:", albedo_path, roughness_path)
+
+            # Fallback defaults
+            base_color = np.array([0.95, 0.95, 0.96, 1.0], dtype=np.float32)
+            roughness_val = 0.9
+
+            if albedo_path.exists():
+                try:
+                    img = Image.open(albedo_path).convert("RGB")
+                    arr = np.asarray(img).astype(np.float32) / 255.0
+                    avg = arr.mean(axis=(0, 1))
+                    base_color = np.array([avg[0], avg[1], avg[2], 1.0], dtype=np.float32)
+                except Exception:
+                    pass
+
+            if roughness_path.exists():
+                try:
+                    rimg = Image.open(roughness_path).convert("L")
+                    rarr = np.asarray(rimg).astype(np.float32) / 255.0
+                    roughness_val = float(rarr.mean())
+                except Exception:
+                    pass
+
+            ground_material.base_color = base_color
+            # apply roughness/specular
+            try:
+                ground_material.roughness = roughness_val
+            except Exception:
+                # some Sapien builds may not expose roughness attribute
+                pass
+            try:
+                ground_material.specular = 0.05
+            except Exception:
+                pass
+            self.scene.add_ground(-1, render_material=ground_material)
+        except Exception:
+            # Fallback to default ground if RenderMaterial isn't available in this build
+            self.scene.add_ground(-1)
+
+        # Softer ambient light with a slight cool tint to avoid a pure-white background
+        self.scene.set_ambient_light([0.22, 0.22, 0.24])
+
+        # Key light: moderate intensity, slightly warm, produces softer highlights
+        self.scene.add_directional_light([0.2, -1.0, -1.0], color=[1.2, 1.05, 0.95], shadow=True)
+
+        # Fill light: soft cool fill to remove harsh white shadows
+        self.scene.add_directional_light([-0.5, 0.8, -0.6], color=[0.5, 0.55, 0.65], shadow=False)
         self._viewer = None
         if self._render_mode == "human" and not self._headless:
             self._viewer = self.scene.create_viewer()
@@ -127,6 +186,19 @@ class So101SceneEnv(gym.Env):
             self.robots.append(robot)
         if self._arms:
             self.robot = self._arms[0].robot
+
+        class _SimpleAgent:
+            def __init__(self, uid, robot):
+                self.uid = uid
+                self.robot = robot
+
+            @property
+            def active_joints(self):
+                return self.robot.get_active_joints()
+
+        # Simple agent placeholder for compatibility
+        if hasattr(self, "robot") and self.robot is not None:
+            self.agent = _SimpleAgent(uid="so101", robot=self.robot)
 
     def _build_arm_interface(self, robot: sapien.Articulation, label: str) -> ArmInterface:
         active_joints = robot.get_active_joints()
@@ -183,13 +255,56 @@ class So101SceneEnv(gym.Env):
             self._wrist_cameras[arm.name] = wrist_camera
             self._wrist_rgbs[arm.name] = np.zeros_like(self._front_rgb)
 
+        # Build sensors mapping for compatibility
+        self._sensors = {}
+        # front: RenderCameraComponent -> wrap to present same methods as mounted_camera
+        self._sensors["front"] = self._front_camera
+
+        # Add top/side cameras using layout helpers (requires the layout helper methods from layout.py)
+        # If you added layout.top_camera_pose/side_camera_pose, use them; else craft poses similar to maniskill_adapter
+        try:
+            top_pose = self._layout.top_camera_pose()
+            side_pose = self._layout.side_camera_pose()
+            self._top_camera = self.scene.add_mounted_camera(
+                name="top_camera",
+                mount=mount,
+                pose=top_pose,
+                width=spec.width,
+                height=spec.height,
+                fovy=np.deg2rad(73.63),
+                near=spec.near,
+                far=spec.far,
+            )
+            self._side_camera = self.scene.add_mounted_camera(
+                name="side_camera",
+                mount=mount,
+                pose=side_pose,
+                width=spec.width,
+                height=spec.height,
+                fovy=np.deg2rad(73.63),
+                near=spec.near,
+                far=spec.far,
+            )
+            self._sensors["top"] = self._top_camera
+            self._sensors["side"] = self._side_camera
+        except Exception:
+            # Fallback: keep only front + wrist cameras
+            pass
+
+        # Wrist cameras: we keep one mapping 'wrist' to the first arm's wrist for legacy code,
+        # and also per-arm '{arm}_wrist' keys already stored in self._wrist_cameras.
+        if self._wrist_cameras:
+            first_arm_name = next(iter(self._wrist_cameras.keys()))
+            self._sensors["wrist"] = self._wrist_cameras[first_arm_name]
+        for arm in self._arms:
+            key = f"{arm.name}_wrist"
+            self._sensors[key] = self._wrist_cameras[arm.name]
+
     def _setup_objects(self) -> None:
         self._layout_actors = spawn_layout(self.scene, self._layout)
-        cube_builder = self.scene.create_actor_builder()
-        cube_builder.add_box_visual(half_size=[0.015, 0.015, 0.015], material=[1, 0, 0])
-        cube_builder.add_box_collision(half_size=[0.015, 0.015, 0.015])
-        self._cube = cube_builder.build_static(name="target_cube")
-        self._cube_height = 0.015
+        # Task objects will be spawned at reset; keep a list for cleanup
+        self._task_objects = []
+        self._object_half = 0.015
 
     def _define_spaces(self) -> None:
         image_shape = (self._camera_spec.height, self._camera_spec.width, 3)
@@ -237,7 +352,9 @@ class So101SceneEnv(gym.Env):
             self.seed(seed)
         self._step_count = 0
         self._reset_robot_state()
-        self._reset_cube_pose()
+        # Clear and spawn task-specific objects (if any)
+        self._clear_task_objects()
+        self._spawn_task_objects()
         self.scene.step()
         self.scene.update_render()
         obs = self._get_observation()
@@ -253,9 +370,78 @@ class So101SceneEnv(gym.Env):
             arm.robot.set_qvel(np.zeros_like(qpos))
 
     def _reset_cube_pose(self) -> None:
-        sample = self._layout.sample_pick_region(self._rng)
-        sample[2] = self._layout.table_surface_z + self._cube_height
-        self._cube.set_pose(sapien.Pose(sample, [1, 0, 0, 0]))
+        # Deprecated: individual cube placement is handled by _spawn_task_objects
+        return
+
+    def _clear_task_objects(self) -> None:
+        for a in list(getattr(self, "_task_objects", []) or []):
+            try:
+                if hasattr(a, "release"):
+                    a.release()
+                elif hasattr(self.scene, "remove_actor"):
+                    # best-effort removal
+                    self.scene.remove_actor(a)
+            except Exception:
+                # ignore failures during cleanup
+                pass
+        self._task_objects = []
+
+    def _spawn_task_objects(self) -> None:
+        """Spawn objects depending on `self._task`:
+        - 'lift': one red cube in the right robot area
+        - 'stack': two cubes (red bottom, green top) stacked in the right robot area
+        - 'sort': two cubes (red, green) in the center bin area
+        """
+        task = (self._task or "lift").lower()
+        half = self._object_half
+        # helper to build a colored cube (static) with an optional yaw rotation around Z
+        def build_cube(color, position, name, yaw: float | None = None):
+            b = self.scene.create_actor_builder()
+            b.add_box_visual(half_size=[half, half, half], material=list(color))
+            b.add_box_collision(half_size=[half, half, half])
+            actor = b.build_static(name=name)
+            # random yaw if not provided
+            if yaw is None:
+                yaw = float(self._rng.uniform(-np.pi, np.pi))
+            qw = float(np.cos(yaw / 2.0))
+            qz = float(np.sin(yaw / 2.0))
+            quat = [qw, 0.0, 0.0, qz]
+            actor.set_pose(sapien.Pose(position, quat))
+            return actor
+
+        if task == "stack":
+            # Spawn two separate cubes in the right robot area (robot must stack them)
+            pos1 = self._layout.sample_pick_region(self._rng, bin_index=2, area="bin")
+            pos2 = self._layout.sample_pick_region(self._rng, bin_index=2, area="bin")
+            # ensure they are not overlapping
+            if np.linalg.norm(pos1[:2] - pos2[:2]) < 0.06:
+                pos2[:2] += np.array([0.06, 0.0])
+            pos1[2] = self._layout.table_surface_z + half
+            pos2[2] = self._layout.table_surface_z + half
+            a1 = build_cube([1, 0, 0], pos1, "cube_red")
+            a2 = build_cube([0, 1, 0], pos2, "cube_green")
+            self._task_objects.extend([a1, a2])
+            return
+
+        if task == "sort":
+            # Two cubes (red and green) in center bin with random yaw
+            pos1 = self._layout.sample_pick_region(self._rng, bin_index=1, area="bin")
+            pos2 = self._layout.sample_pick_region(self._rng, bin_index=1, area="bin")
+            # ensure not too close
+            if np.linalg.norm(pos1[:2] - pos2[:2]) < 0.03:
+                pos2[:2] += np.array([0.03, 0.03])
+            pos1[2] = self._layout.table_surface_z + half
+            pos2[2] = self._layout.table_surface_z + half
+            a1 = build_cube([1, 0, 0], pos1, "cube_red", yaw=None)
+            a2 = build_cube([0, 1, 0], pos2, "cube_green", yaw=None)
+            self._task_objects.extend([a1, a2])
+            return
+
+        # Default / 'lift': single red cube in the right robot area with random yaw
+        sample = self._layout.sample_pick_region(self._rng, bin_index=2, area="bin")
+        sample[2] = self._layout.table_surface_z + half
+        a = build_cube([1, 0, 0], sample, "cube_red", yaw=None)
+        self._task_objects.append(a)
 
     def step(self, action: np.ndarray):
         clipped = np.clip(action, self.action_space.low, self.action_space.high)
@@ -283,11 +469,21 @@ class So101SceneEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _compute_reward(self) -> float:
-        cube_pos = self._cube.get_pose().p
+        # compute min distance from any arm end-effector to any spawned task object
+        object_positions = []
+        for a in getattr(self, "_task_objects", []):
+            try:
+                object_positions.append(np.array(a.get_pose().p))
+            except Exception:
+                pass
+        if not object_positions:
+            self._last_distance = 1e6
+            return -self._last_distance
         distances = []
         for arm in self._arms:
-            eef_pos = arm.eef_link.get_pose().p
-            distances.append(np.linalg.norm(np.array(eef_pos) - np.array(cube_pos)))
+            eef_pos = np.array(arm.eef_link.get_pose().p)
+            for obj_pos in object_positions:
+                distances.append(np.linalg.norm(eef_pos - obj_pos))
         self._last_distance = float(min(distances))
         shaped = -self._last_distance
         if self._last_distance < self._success_radius:
@@ -340,3 +536,66 @@ class So101SceneEnv(gym.Env):
         self.robots = []
         self.robot = None
         self._arms = []
+
+    def take_picture(self, camera_name: str):
+        """Compatibility method: returns an RGBA uint8 image for a named camera."""
+        self.scene.update_render()
+        if camera_name not in self._sensors:
+            raise KeyError(f"Camera '{camera_name}' not found. Available: {list(self._sensors.keys())}")
+        cam = self._sensors[camera_name]
+        # Some cam objects have take_picture/get_picture, others use RenderCameraComponent API
+        try:
+            cam.take_picture()
+            color = cam.get_picture("Color")
+        except Exception:
+            # RenderCameraComponent path (front camera implementation)
+            if hasattr(cam, "take_picture"):
+                cam.take_picture()
+                color = cam.get_picture("Color")
+            else:
+                raise RuntimeError("Unsupported camera object type for take_picture")
+        # color as float [H,W,3] in [0,1] -> convert to uint8 RGB
+        rgb = np.clip(color[..., :3], 0.0, 1.0) * 255.0
+        rgb_uint8 = rgb.astype(np.uint8)
+        h, w, _ = rgb_uint8.shape
+        rgba = np.full((h, w, 4), 255, dtype=np.uint8)
+        rgba[:, :, :3] = rgb_uint8
+        return rgba
+
+    def get_obs_compat(self):
+        """
+        Return a compatibility dict similar to ManiSkill example:
+        {'qpos': <ndarray>, 'cube_pos': <ndarray>, 'cube_quat': <ndarray>}
+        """
+        # qpos: use first arm's active joints
+        if not self._arms:
+            raise RuntimeError("No arms available")
+        arm = self._arms[0]
+        qpos_full = arm.robot.get_qpos()
+        qpos = qpos_full[arm.joint_indices].astype(np.float32)
+        # cube pose
+        # Prefer the first task object (if any) for compatibility
+        cube_pos = np.zeros(3, dtype=np.float32)
+        cube_quat = np.array([1, 0, 0, 0], dtype=np.float32)
+        if getattr(self, "_task_objects", None):
+            try:
+                p = self._task_objects[0].get_pose()
+                cube_pos = np.array(p.p, dtype=np.float32)
+                cube_quat = np.array(p.r, dtype=np.float32) if hasattr(p, "r") else np.array(p.q, dtype=np.float32)
+            except Exception:
+                pass
+        # Normalize shapes (flatten)
+        cube_pos = cube_pos.flatten()
+        cube_quat = cube_quat.flatten()
+        return {"qpos": qpos, "cube_pos": cube_pos, "cube_quat": cube_quat}
+
+    def check_success(self) -> bool:
+        for a in getattr(self, "_task_objects", []):
+            try:
+                p = np.array(a.get_pose().p, dtype=np.float32).flatten()
+                lift_height = p[2] - self._object_half
+                if float(lift_height) >= 0.05:
+                    return True
+            except Exception:
+                continue
+        return False

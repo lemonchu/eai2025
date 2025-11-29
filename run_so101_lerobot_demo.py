@@ -37,6 +37,9 @@ def rollout(args: argparse.Namespace) -> None:
         headless=not args.show_viewer,
         max_episode_steps=args.max_steps,
     )
+    # Pass through the simple `task` argument to the underlying env constructor
+    cfg.gym_kwargs = dict(cfg.gym_kwargs)
+    cfg.gym_kwargs["task"] = args.task
     env = gym.make(cfg.gym_id, **cfg.gym_kwargs)
     record_root = Path(args.record_dir).resolve()
     record_root.mkdir(parents=True, exist_ok=True)
@@ -71,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=200, help="Max steps per episode")
     parser.add_argument("--record-dir", type=str, default="outputs/so101_demo", help="Directory for saved frames")
     parser.add_argument("--scene-root", type=str, default=None, help="Override path to SO-101 assets")
+    parser.add_argument("--task", type=str, default="lift", help="Task to spawn: lift|stack|sort")
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed")
     parser.add_argument("--show-viewer", action="store_true", help="Open the Sapien viewer (requires GUI)")
     return parser.parse_args()

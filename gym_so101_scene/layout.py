@@ -47,7 +47,7 @@ class TableLayout:
 
     # Robot base markers within robot areas
     robot_base_offset_cm: float = 6.4              # offset from edge to robot base
-    robot_base_size_cm: tuple[float, float] = (11.0, 15.0)  # width, depth
+    robot_base_size_cm: tuple[float, float] = (11.0, 8.1)  # width, depth
 
     # Camera position relative to layout
     camera_offset_cm: tuple[float, float, float] = (31.6, 32.0, 55.0)  # (x, y, z)
@@ -62,7 +62,7 @@ class TableLayout:
     @property
     def table_width_cm(self) -> float:
         """Total table width (left + right areas)."""
-        return self.left_area_width_cm + self.right_area_width_cm
+        return self.left_area_width_cm + self.right_area_width_cm + self.boundary_width_cm
 
     @property
     def table_width_m(self) -> float:
@@ -82,10 +82,10 @@ class TableLayout:
 
     def table_to_world(self, x_cm: float, y_cm: float, z_offset: float = 0.0) -> np.ndarray:
         """Map figure coordinates to Sapien world coordinates."""
-
+        # Map table coordinates: x_cm (left->right) -> world X, y_cm (front->back) -> world Y
         world = np.array([
             self.world_origin[0] + cm(y_cm),
-            self.world_origin[1] + cm(x_cm),
+            self.world_origin[1] - cm(x_cm),
             self.table_height + z_offset,
         ])
         return world
@@ -106,16 +106,38 @@ class TableLayout:
         pose[:3, 3] = pos
         return sapien.Pose(pose)
 
+    def top_camera_pose(self) -> sapien.Pose:
+        top_mat44 = np.eye(4)
+        top_rot = np.array([
+            [-1, 0, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+        ])
+        top_mat44[:3, :3] = top_rot
+        top_mat44[:3, 3] = self.table_to_world(52.0, 15.0, cm(10.0))  # adjust numbers or use camera_offset
+        return sapien.Pose(top_mat44)
+
+    def side_camera_pose(self) -> sapien.Pose:
+        side_mat44 = np.eye(4)
+        side_rot = np.array([
+            [0, 1, 0],
+            [-1, 0, 0],
+            [0, 0, 1],
+        ])
+        side_mat44[:3, :3] = side_rot
+        side_mat44[:3, 3] = self.table_to_world(26.0, 60.0, cm(10.0))  # tune as needed
+        return sapien.Pose(side_mat44)
+
     def _cluster_properties(self) -> tuple[float, float]:
         """Compute the left edge and total width of the bin cluster.
 
         The bins are positioned at the top of the left working area (60 cm).
-        Starting from x=0, they span the full bin widths plus boundary lines.
+        Starting from x=2, they span the full bin widths plus boundary lines.
         """
         total_boundary_cm = self.boundary_width_cm * (len(self.bin_widths_cm) + 1)
         cluster_width_cm = sum(self.bin_widths_cm) + total_boundary_cm
-        # Bins start at x=0 (left edge of the table)
-        left_edge_cm = 0.0
+        # Bins start at x=2 (left edge of the table)
+        left_edge_cm = 2.0
         return left_edge_cm, cluster_width_cm
 
     def horizontal_line_positions(self) -> tuple[float, ...]:
@@ -126,8 +148,8 @@ class TableLayout:
         - Second line at y = robot_area_depth_cm + bin_band_depth_cm (31.4) - top of bins
         """
         return (
-            self.robot_area_depth_cm,
-            self.robot_area_depth_cm + self.bin_band_depth_cm,
+            self.robot_area_depth_cm + self.boundary_width_cm / 2,
+            self.robot_area_depth_cm + self.bin_band_depth_cm + 3 * self.boundary_width_cm / 2,
         )
 
     def vertical_line_positions(self) -> tuple[float, ...]:
@@ -166,11 +188,43 @@ class TableLayout:
         edges = self.bin_left_edges_cm()
         return edges[index] + self.bin_widths_cm[index] / 2
 
-    def sample_pick_region(self, rng: np.random.Generator, bin_index: int = 1) -> np.ndarray:
-        """Sample a random position within a bin for object placement."""
+    def sample_pick_region(
+        self,
+        rng: np.random.Generator,
+        bin_index: int = 1,
+        area: str = "bin",
+        robot_idx: int = 1,
+    ) -> np.ndarray:
+        """Sample a random position for object placement.
+
+        Parameters
+        - rng: random generator
+        - bin_index: index of the top bins (0=left,1=center,2=right)
+        - area: either 'bin' (sample inside a bin) or 'robot' (sample inside robot area)
+        - robot_idx: which robot area to sample (0=left,1=right)
+
+        Returns a world-coordinate np.ndarray [x,y,z].
+        """
+        area = str(area).lower()
+        if area == "robot":
+            # Sample within the robot area rectangle (in table coordinates cm)
+            robot_areas = self.robot_area_positions()
+            robot_areas = (robot_areas[0], robot_areas[1])
+            robot_idx = int(np.clip(robot_idx, 0, 1))
+            x0_cm, y0_cm = robot_areas[robot_idx]
+            w_cm = self.robot_area_width_cm
+            d_cm = self.robot_area_depth_cm
+            # sample within area with a small margin (10% inward)
+            margin_x = max(0.1 * w_cm, 0.5)
+            margin_y = max(0.1 * d_cm, 0.5)
+            sx_cm = rng.uniform(x0_cm + margin_x, x0_cm + w_cm - margin_x)
+            sy_cm = rng.uniform(y0_cm + margin_y, y0_cm + d_cm - margin_y)
+            world = self.table_to_world(sx_cm, sy_cm, self.table_thickness)
+            return world
+        # default: sample inside a top bin region
         bin_index = int(np.clip(bin_index, 0, len(self.bin_widths_cm) - 1))
         center_x_cm = self.bin_center_cm(bin_index)
-        center_y_cm = self.robot_area_depth_cm + self.bin_band_depth_cm / 2
+        center_y_cm = self.robot_area_depth_cm + self.bin_band_depth_cm / 2 + self.boundary_width_cm
         center = self.table_to_world(center_x_cm, center_y_cm, self.table_thickness)
         width_margin = max(self.bin_widths_cm[bin_index] - 2 * self.boundary_width_cm, 1.0)
         dx = rng.uniform(-cm(width_margin) / 2, cm(width_margin) / 2)
@@ -193,7 +247,7 @@ class TableLayout:
         """
         left_area = (0.0, 0.0)
         # Right robot area starts after first two bins (matching reference layout)
-        right_x = self.bin_widths_cm[0] + self.bin_widths_cm[1]  # 16.6 + 15.6 = 32.2
+        right_x = self.robot_area_width_cm + self.bin_widths_cm[1] + 2 * self.boundary_width_cm  # 20.4 + 15.6 + 1.8 * 2 = 39.6
         right_area = (right_x, 0.0)
         return (left_area, right_area)
 
@@ -202,9 +256,9 @@ class TableLayout:
 
         Robot bases are positioned within the robot areas:
         - Left base: offset 6.4 cm from left edge of left robot area (x=0)
-        - Right base: offset 6.4 cm from left edge of right robot area (x=32.2)
+        - Right base: offset 6.4 cm from right edge of right robot area (x=39.6)
 
-        The base markers are 11.0 cm wide × 15.0 cm deep.
+        The base markers are 11.0 cm wide × 8.1 cm deep, based on STL measurements.
         """
         base_half_w_cm = self.robot_base_size_cm[0] / 2
         base_depth_cm = self.robot_base_size_cm[1]
@@ -217,10 +271,10 @@ class TableLayout:
             self.marker_height,
         )
 
-        # Right robot base: offset from x=32.2 (left edge of right robot area)
-        right_robot_area_x = self.bin_widths_cm[0] + self.bin_widths_cm[1]  # 32.2
+        # Right robot base: offset from x=42.6 (left edge of right robot area)
+        right_robot_area_x = self.left_area_width_cm - self.robot_base_offset_cm - self.robot_base_size_cm[0]  # 42.6
         right_center = self.table_to_world(
-            right_robot_area_x + self.robot_base_offset_cm + base_half_w_cm,
+            right_robot_area_x + base_half_w_cm,
             y_center_cm,
             self.marker_height,
         )
@@ -240,18 +294,32 @@ def spawn_layout(scene: sapien.Scene, layout: TableLayout) -> dict[str, list[sap
     """Spawn the table layout in the Sapien scene.
 
     Creates:
-    - Table top (full 118.2 x 60 cm)
+    - Table top (full 120.0 x 60 cm)
     - Horizontal boundary lines at bin region boundaries
     - Vertical boundary lines for bins and main area separator
     - Robot area markers (blue dotted regions)
-    - Robot base markers
     """
     actors: dict[str, list[sapien.Actor]] = {
         "table": [],
         "boundaries": [],
         "robot_markers": [],
-        "robot_areas": [],
+        # "robot_areas": [],
     }
+
+    # Add a visible ground plane (large thin box) slightly below the table
+    # to serve as a gray, rough-looking floor in renders. Make it a bit
+    # larger than the table so its edges are visible from the front camera.
+    # ground_half: slightly larger than table half-extents (meters)
+    ground_half = [layout.table_depth_m / 2 + 5.5, layout.table_width_m / 2 + 5.5, 0.005]
+    # place ground below table surface by 3cm
+    ground_pose = layout.table_to_world(
+        layout.table_width_cm / 2,
+        layout.table_depth_cm / 2,
+        -0.03,
+    )
+    actors["table"].append(
+        _build_box(scene, ground_half, [0.05, 0.05, 0.05], "ground_plane", ground_pose)
+    )
 
     # Create main table surface
     table_half = [layout.table_depth_m / 2, layout.table_width_m / 2, layout.table_thickness / 2]
@@ -261,15 +329,15 @@ def spawn_layout(scene: sapien.Scene, layout: TableLayout) -> dict[str, list[sap
         layout.table_thickness / 2,
     )
     actors["table"].append(
-        _build_box(scene, table_half, [0.95, 0.95, 0.95], "table_top", table_pose)
+        _build_box(scene, table_half, [0.85, 0.85, 0.85], "table_top", table_pose)
     )
 
     # Horizontal boundaries at bin region (only span the bin cluster width)
-    _, cluster_width_cm = layout._cluster_properties()
+    left_boundary, cluster_width_cm = layout._cluster_properties()
     bin_region_center_x = cluster_width_cm / 2
     for idx, depth_cm in enumerate(layout.horizontal_line_positions()):
         pose = layout.table_to_world(
-            bin_region_center_x,
+            left_boundary + cluster_width_cm / 2,
             depth_cm,
             layout.table_surface_z + layout.line_height / 2,
         )
@@ -280,8 +348,8 @@ def spawn_layout(scene: sapien.Scene, layout: TableLayout) -> dict[str, list[sap
 
     # Vertical boundaries for the bin cluster (4 lines between/around 3 bins)
     vertical_positions = layout.vertical_line_positions()
-    bin_y_start = layout.robot_area_depth_cm
-    bin_y_end = layout.robot_area_depth_cm + layout.bin_band_depth_cm
+    bin_y_start = layout.robot_area_depth_cm + layout.boundary_width_cm
+    bin_y_end = layout.robot_area_depth_cm + layout.bin_band_depth_cm + layout.boundary_width_cm
     bin_center_y = (bin_y_start + bin_y_end) / 2
     bin_height_m = cm(layout.bin_band_depth_cm)
 
@@ -295,11 +363,31 @@ def spawn_layout(scene: sapien.Scene, layout: TableLayout) -> dict[str, list[sap
         actors["boundaries"].append(
             _build_box(scene, half, [0, 0, 0], f"boundary_v_bin_{idx}", pose)
         )
-
+    # Robot area vertical boundaries
+    robot_y_start = 0.0
+    robot_y_end = cm(layout.robot_area_depth_cm)
+    # Append two lines
+    half = [robot_y_end / 2, layout.boundary_width_m / 2, layout.line_height / 2]
+    left_pose = layout.table_to_world(
+        layout.robot_area_width_cm + layout.boundary_width_cm / 2,
+        layout.robot_area_depth_cm / 2,
+        layout.table_surface_z + layout.line_height / 2,
+    )
+    actors["boundaries"].append(
+        _build_box(scene, half, [0, 0, 0], "boundary_v_robot_left", left_pose)
+    )
+    right_pose = layout.table_to_world(
+        layout.left_area_width_cm - layout.robot_area_width_cm - layout.boundary_width_cm / 2,
+        layout.robot_area_depth_cm / 2,
+        layout.table_surface_z + layout.line_height / 2,
+    )
+    actors["boundaries"].append(
+        _build_box(scene, half, [0, 0, 0], "boundary_v_robot_right", right_pose)
+    )
     # Main vertical boundary line at x=60.0 cm (full height, separates left/right areas)
     main_boundary_x = layout.left_area_width_cm
     main_boundary_pose = layout.table_to_world(
-        main_boundary_x,
+        main_boundary_x + layout.boundary_width_cm / 2,
         layout.table_depth_cm / 2,
         layout.table_surface_z + layout.line_height / 2,
     )
@@ -307,26 +395,6 @@ def spawn_layout(scene: sapien.Scene, layout: TableLayout) -> dict[str, list[sap
     actors["boundaries"].append(
         _build_box(scene, main_boundary_half, [0, 0, 0], "boundary_main", main_boundary_pose)
     )
-
-    # Robot areas (blue dotted pad regions)
-    robot_area_positions = layout.robot_area_positions()
-    robot_area_half = [
-        cm(layout.robot_area_depth_cm) / 2,
-        cm(layout.robot_area_width_cm) / 2,
-        layout.marker_height / 2,
-    ]
-    for idx, (x_cm, y_cm) in enumerate(robot_area_positions):
-        center_x = x_cm + layout.robot_area_width_cm / 2
-        center_y = y_cm + layout.robot_area_depth_cm / 2
-        pose = layout.table_to_world(
-            center_x,
-            center_y,
-            layout.table_surface_z + layout.marker_height / 2,
-        )
-        actors["robot_areas"].append(
-            _build_box(scene, robot_area_half, [0.7, 0.85, 1.0], f"robot_area_{idx}", pose)
-        )
-
     # Robot base markers (positioned within robot areas)
     base_half = [
         cm(layout.robot_base_size_cm[1]) / 2,
