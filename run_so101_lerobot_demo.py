@@ -49,10 +49,8 @@ def rollout(args: argparse.Namespace) -> None:
         while not done:
             action = env.action_space.sample()
             obs, reward, terminated, truncated, info = env.step(action)
-            front = obs["images"]["front"]
-            wrist = obs["images"]["wrist"]
-            save_rgb(front, episode_dir / "front" / f"frame_{step_idx:04d}.png")
-            save_rgb(wrist, episode_dir / "wrist" / f"frame_{step_idx:04d}.png")
+            for camera_name, frame in obs["images"].items():
+                save_rgb(frame, episode_dir / camera_name / f"frame_{step_idx:04d}.png")
             step_idx += 1
             done = terminated or truncated
         print(

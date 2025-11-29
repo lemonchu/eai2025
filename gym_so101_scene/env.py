@@ -23,6 +23,18 @@ class CameraSpec:
     far: float = 5.0
 
 
+@dataclass
+class ArmInterface:
+    name: str
+    robot: sapien.Articulation
+    joint_indices: list[int]
+    joint_lower: np.ndarray
+    joint_upper: np.ndarray
+    initial_qpos: np.ndarray
+    eef_link: sapien.Link
+    camera_link: sapien.Link
+
+
 class So101SceneEnv(gym.Env):
     """Minimal Sapien-based SO-101 scene compatible with LeRobot policies."""
 
@@ -52,8 +64,18 @@ class So101SceneEnv(gym.Env):
         self._camera_spec = CameraSpec()
         self._layout = TableLayout()
         self._layout_actors: dict[str, list[Any]] | None = None
+        self._controlled_joint_names = [
+            "shoulder_pan",
+            "shoulder_lift",
+            "elbow_flex",
+            "wrist_flex",
+            "wrist_roll",
+            "gripper",
+        ]
+        self._initial_joint_positions = np.array([0.0, -0.4, 0.7, 0.4, 0.0, 0.4], dtype=np.float32)
+        self._arms: list[ArmInterface] = []
         self._setup_scene()
-        self._setup_robot()
+        self._setup_robots()
         self._setup_cameras()
         self._setup_objects()
         self._define_spaces()
@@ -73,32 +95,49 @@ class So101SceneEnv(gym.Env):
             self._viewer.set_camera_xyz(x=-2, y=0, z=1)
             self._viewer.set_camera_rpy(r=0, p=-0.3, y=0)
 
-    def _setup_robot(self) -> None:
+    def _setup_robots(self) -> None:
         loader = self.scene.create_urdf_loader()
         loader.fix_root_link = True
-        self.robot = loader.load(str(self._scene_root / "so101.urdf"))
-        if self.robot is None:
-            raise FileNotFoundError(f"Failed to load URDF at {self._scene_root}")
-        self.robot.set_root_pose(sapien.Pose([0, 0, 0], [1, 0, 0, 0]))
-        self._controlled_joint_names = [
-            "shoulder_pan",
-            "shoulder_lift",
-            "elbow_flex",
-            "wrist_flex",
-            "wrist_roll",
-            "gripper",
-        ]
-        active_joints = self.robot.get_active_joints()
+        base_centers = list(self._layout.robot_base_centers())
+        if len(base_centers) < 2:
+            raise RuntimeError("TableLayout must provide at least two robot base positions")
+        arm_labels = ("left", "right")
+        self.robots: list[sapien.Articulation] = []
+        for idx, label in enumerate(arm_labels):
+            robot = loader.load(str(self._scene_root / "so101.urdf"))
+            if robot is None:
+                raise FileNotFoundError(f"Failed to load URDF at {self._scene_root}")
+            base_center = base_centers[idx]
+            root_pose = sapien.Pose([0.0, base_center[1], 0.0], [1, 0, 0, 0])
+            robot.set_root_pose(root_pose)
+            arm = self._build_arm_interface(robot, label)
+            self._arms.append(arm)
+            self.robots.append(robot)
+        if self._arms:
+            self.robot = self._arms[0].robot
+
+    def _build_arm_interface(self, robot: sapien.Articulation, label: str) -> ArmInterface:
+        active_joints = robot.get_active_joints()
         joints = {joint.name: joint for joint in active_joints}
         missing = [name for name in self._controlled_joint_names if name not in joints]
         if missing:
             raise RuntimeError(f"Missing joints in URDF: {missing}")
-        self._joint_indices = [active_joints.index(joints[name]) for name in self._controlled_joint_names]
+        indices = [active_joints.index(joints[name]) for name in self._controlled_joint_names]
         limits = [joints[name].get_limits()[0] for name in self._controlled_joint_names]
-        self._joint_lower = np.array([limit[0] for limit in limits], dtype=np.float32)
-        self._joint_upper = np.array([limit[1] for limit in limits], dtype=np.float32)
-        self._initial_qpos = np.array([0.0, -0.4, 0.7, 0.4, 0.0, 0.4], dtype=np.float32)
-        self._eef_link = next(link for link in self.robot.get_links() if link.name == "gripper_frame_link")
+        lower = np.array([limit[0] for limit in limits], dtype=np.float32)
+        upper = np.array([limit[1] for limit in limits], dtype=np.float32)
+        eef_link = next(link for link in robot.get_links() if link.name == "gripper_frame_link")
+        camera_link = next(link for link in robot.get_links() if "camera_link" in link.name)
+        return ArmInterface(
+            name=label,
+            robot=robot,
+            joint_indices=indices,
+            joint_lower=lower,
+            joint_upper=upper,
+            initial_qpos=self._initial_joint_positions.copy(),
+            eef_link=eef_link,
+            camera_link=camera_link,
+        )
 
     def _setup_cameras(self) -> None:
         spec = self._camera_spec
@@ -115,19 +154,22 @@ class So101SceneEnv(gym.Env):
         mount.set_pose(self._layout.camera_pose())
         camera.set_local_pose(sapien.Pose([0, 0, 0], [1, 0, 0, 0]))
         self._front_camera = camera
-        camera_link = next(link for link in self.robot.get_links() if "camera_link" in link.name)
-        self._wrist_camera = self.scene.add_mounted_camera(
-            name="wrist_camera",
-            mount=camera_link.entity,
-            pose=sapien.Pose(np.eye(4)),
-            width=spec.width,
-            height=spec.height,
-            fovy=np.deg2rad(70.0),
-            near=spec.near,
-            far=spec.far,
-        )
+        self._wrist_cameras: dict[str, Any] = {}
         self._front_rgb = np.zeros((spec.height, spec.width, 3), dtype=np.uint8)
-        self._wrist_rgb = np.zeros_like(self._front_rgb)
+        self._wrist_rgbs: dict[str, np.ndarray] = {}
+        for arm in self._arms:
+            wrist_camera = self.scene.add_mounted_camera(
+                name=f"{arm.name}_wrist_camera",
+                mount=arm.camera_link.entity,
+                pose=sapien.Pose(np.eye(4)),
+                width=spec.width,
+                height=spec.height,
+                fovy=np.deg2rad(70.0),
+                near=spec.near,
+                far=spec.far,
+            )
+            self._wrist_cameras[arm.name] = wrist_camera
+            self._wrist_rgbs[arm.name] = np.zeros_like(self._front_rgb)
 
     def _setup_objects(self) -> None:
         self._layout_actors = spawn_layout(self.scene, self._layout)
@@ -139,30 +181,37 @@ class So101SceneEnv(gym.Env):
 
     def _define_spaces(self) -> None:
         image_shape = (self._camera_spec.height, self._camera_spec.width, 3)
+        image_spaces = {
+            "front": spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8),
+        }
+        for arm in self._arms:
+            image_spaces[f"{arm.name}_wrist"] = spaces.Box(
+                low=0, high=255, shape=image_shape, dtype=np.uint8
+            )
+
+        state_spaces = {}
+        for arm in self._arms:
+            state_spaces[f"{arm.name}_joint_pos"] = spaces.Box(
+                arm.joint_lower, arm.joint_upper, dtype=np.float32
+            )
+            vel_limit = np.full_like(arm.joint_lower, np.inf, dtype=np.float32)
+            state_spaces[f"{arm.name}_joint_vel"] = spaces.Box(
+                low=-vel_limit,
+                high=vel_limit,
+                dtype=np.float32,
+            )
+
         self.observation_space = spaces.Dict(
             {
-                "images": spaces.Dict(
-                    {
-                        "front": spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8),
-                        "wrist": spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8),
-                    }
-                ),
-                "state": spaces.Dict(
-                    {
-                        "joint_pos": spaces.Box(self._joint_lower, self._joint_upper, dtype=np.float32),
-                        "joint_vel": spaces.Box(
-                            low=-np.full_like(self._joint_lower, np.inf, dtype=np.float32),
-                            high=np.full_like(self._joint_upper, np.inf, dtype=np.float32),
-                            dtype=np.float32,
-                        ),
-                    }
-                ),
+                "images": spaces.Dict(image_spaces),
+                "state": spaces.Dict(state_spaces),
             }
         )
+        joint_dim = len(self._controlled_joint_names) * len(self._arms)
         self.action_space = spaces.Box(
             low=-self._action_scale,
             high=self._action_scale,
-            shape=(len(self._controlled_joint_names),),
+            shape=(joint_dim,),
             dtype=np.float32,
         )
 
@@ -183,11 +232,13 @@ class So101SceneEnv(gym.Env):
         return obs, {"success": False}
 
     def _reset_robot_state(self) -> None:
-        qpos = self.robot.get_qpos()
-        for i, idx in enumerate(self._joint_indices):
-            qpos[idx] = float(np.clip(self._initial_qpos[i], self._joint_lower[i], self._joint_upper[i]))
-        self.robot.set_qpos(qpos)
-        self.robot.set_qvel(np.zeros_like(qpos))
+        for arm in self._arms:
+            qpos = arm.robot.get_qpos()
+            for i, idx in enumerate(arm.joint_indices):
+                target = np.clip(arm.initial_qpos[i], arm.joint_lower[i], arm.joint_upper[i])
+                qpos[idx] = float(target)
+            arm.robot.set_qpos(qpos)
+            arm.robot.set_qvel(np.zeros_like(qpos))
 
     def _reset_cube_pose(self) -> None:
         sample = self._layout.sample_pick_region(self._rng)
@@ -196,12 +247,15 @@ class So101SceneEnv(gym.Env):
 
     def step(self, action: np.ndarray):
         clipped = np.clip(action, self.action_space.low, self.action_space.high)
-        qpos = self.robot.get_qpos()
-        for i, idx in enumerate(self._joint_indices):
-            target = np.clip(qpos[idx] + clipped[i], self._joint_lower[i], self._joint_upper[i])
-            qpos[idx] = float(target)
-        self.robot.set_qpos(qpos)
-        self.robot.set_qvel(np.zeros_like(qpos))
+        per_arm = len(self._controlled_joint_names)
+        splits = [clipped[i * per_arm:(i + 1) * per_arm] for i in range(len(self._arms))]
+        for arm, delta in zip(self._arms, splits):
+            qpos = arm.robot.get_qpos()
+            for offset, idx in enumerate(arm.joint_indices):
+                target = np.clip(qpos[idx] + delta[offset], arm.joint_lower[offset], arm.joint_upper[offset])
+                qpos[idx] = float(target)
+            arm.robot.set_qpos(qpos)
+            arm.robot.set_qvel(np.zeros_like(qpos))
         for _ in range(4):
             self.scene.step()
         self.scene.update_render()
@@ -217,33 +271,42 @@ class So101SceneEnv(gym.Env):
         return obs, reward, terminated, truncated, info
 
     def _compute_reward(self) -> float:
-        eef_pos = self._eef_link.get_pose().p
         cube_pos = self._cube.get_pose().p
-        self._last_distance = float(np.linalg.norm(np.array(eef_pos) - np.array(cube_pos)))
+        distances = []
+        for arm in self._arms:
+            eef_pos = arm.eef_link.get_pose().p
+            distances.append(np.linalg.norm(np.array(eef_pos) - np.array(cube_pos)))
+        self._last_distance = float(min(distances))
         shaped = -self._last_distance
         if self._last_distance < self._success_radius:
             shaped += 1.0
         return shaped
 
     def _get_observation(self) -> dict[str, Any]:
-        front, wrist = self._render_cameras()
-        joint_pos = self.robot.get_qpos()[self._joint_indices].astype(np.float32)
-        joint_vel = self.robot.get_qvel()[self._joint_indices].astype(np.float32)
-        return {
-            "images": {"front": front, "wrist": wrist},
-            "state": {"joint_pos": joint_pos, "joint_vel": joint_vel},
-        }
+        front, wrist_frames = self._render_cameras()
+        images: dict[str, np.ndarray] = {"front": front}
+        state_dict: dict[str, np.ndarray] = {}
+        for arm in self._arms:
+            wrist_key = f"{arm.name}_wrist"
+            images[wrist_key] = wrist_frames[wrist_key]
+            joint_pos = arm.robot.get_qpos()[arm.joint_indices].astype(np.float32)
+            joint_vel = arm.robot.get_qvel()[arm.joint_indices].astype(np.float32)
+            state_dict[f"{arm.name}_joint_pos"] = joint_pos
+            state_dict[f"{arm.name}_joint_vel"] = joint_vel
+        return {"images": images, "state": state_dict}
 
-    def _render_cameras(self) -> tuple[np.ndarray, np.ndarray]:
+    def _render_cameras(self) -> tuple[np.ndarray, dict[str, np.ndarray]]:
         if self._front_camera is not None:
             self._front_camera.take_picture()
             color = self._front_camera.get_picture("Color")
             self._front_rgb = self._float_to_uint8(color)
-        if self._wrist_camera is not None:
-            self._wrist_camera.take_picture()
-            color = self._wrist_camera.get_picture("Color")
-            self._wrist_rgb = self._float_to_uint8(color)
-        return self._front_rgb.copy(), self._wrist_rgb.copy()
+        wrist_frames: dict[str, np.ndarray] = {}
+        for name, camera in self._wrist_cameras.items():
+            camera.take_picture()
+            color = camera.get_picture("Color")
+            self._wrist_rgbs[name] = self._float_to_uint8(color)
+            wrist_frames[f"{name}_wrist"] = self._wrist_rgbs[name].copy()
+        return self._front_rgb.copy(), wrist_frames
 
     @staticmethod
     def _float_to_uint8(rgba: np.ndarray) -> np.ndarray:
@@ -262,4 +325,6 @@ class So101SceneEnv(gym.Env):
             self._viewer.close()
             self._viewer = None
         self.scene = None
+        self.robots = []
         self.robot = None
+        self._arms = []
