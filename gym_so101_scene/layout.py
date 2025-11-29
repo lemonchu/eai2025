@@ -184,34 +184,41 @@ class TableLayout:
     def robot_area_positions(self) -> tuple[tuple[float, float], tuple[float, float]]:
         """Return (x, y) positions for bottom-left corner of each robot area.
 
-        According to reference:
-        - Left robot area: x=0, y=0, width=20.4, depth=15.0
-        - Right robot area: x=32.2 (after first two bins), y=0, width=20.4, depth=15.0
+        Based on the reference matplotlib code from the problem statement:
+        - Left robot area: starts at x=0, y=0
+        - Right robot area: starts at x=32.2 (= 16.6 + 15.6, after first two bin widths), y=0
+
+        Both robot areas have width=20.4 cm and depth=15.0 cm, positioned at the
+        bottom of the table (y=0 to y=15.0).
         """
         left_area = (0.0, 0.0)
-        # Right robot area starts after left bin + middle bin
-        right_x = self.bin_widths_cm[0] + self.bin_widths_cm[1]
+        # Right robot area starts after first two bins (matching reference layout)
+        right_x = self.bin_widths_cm[0] + self.bin_widths_cm[1]  # 16.6 + 15.6 = 32.2
         right_area = (right_x, 0.0)
         return (left_area, right_area)
 
     def robot_base_centers(self) -> Iterable[np.ndarray]:
         """Return world positions for robot base markers.
 
-        Robot bases are positioned within the robot areas with specified offset.
+        Robot bases are positioned within the robot areas:
+        - Left base: offset 6.4 cm from left edge of left robot area (x=0)
+        - Right base: offset 6.4 cm from left edge of right robot area (x=32.2)
+
+        The base markers are 11.0 cm wide × 15.0 cm deep.
         """
         base_half_w_cm = self.robot_base_size_cm[0] / 2
         base_depth_cm = self.robot_base_size_cm[1]
         y_center_cm = base_depth_cm / 2
 
-        # Left robot base: offset from left edge of left robot area
+        # Left robot base: offset from x=0 (left edge of left robot area)
         left_center = self.table_to_world(
             self.robot_base_offset_cm + base_half_w_cm,
             y_center_cm,
             self.marker_height,
         )
 
-        # Right robot base: offset from left edge of right robot area
-        right_robot_area_x = self.bin_widths_cm[0] + self.bin_widths_cm[1]
+        # Right robot base: offset from x=32.2 (left edge of right robot area)
+        right_robot_area_x = self.bin_widths_cm[0] + self.bin_widths_cm[1]  # 32.2
         right_center = self.table_to_world(
             right_robot_area_x + self.robot_base_offset_cm + base_half_w_cm,
             y_center_cm,
