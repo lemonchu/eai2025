@@ -50,7 +50,7 @@ class TableLayout:
     robot_base_size_cm: tuple[float, float] = (11.0, 15.0)  # width, depth
 
     # Camera position relative to layout
-    camera_offset_cm: tuple[float, float, float] = (31.6, 26.0, 40.7)  # (x, y, z)
+    camera_offset_cm: tuple[float, float, float] = (31.6, 32.0, 55.0)  # (x, y, z)
 
     # World positioning
     world_origin: np.ndarray = field(default_factory=lambda: np.array([0.05, -0.30, 0.0]))

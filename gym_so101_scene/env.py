@@ -15,12 +15,24 @@ from .layout import TableLayout, spawn_layout
 
 @dataclass
 class CameraSpec:
-    width: int = 640
-    height: int = 480
-    fovx_deg: float = 117.12
-    fovy_deg: float = 73.63
+    width: int = 960
+    height: int = 720
+    fovx_deg: float = 125.0
     near: float = 0.01
     far: float = 5.0
+
+    @property
+    def aspect_ratio(self) -> float:
+        return self.width / self.height
+
+    @property
+    def fovx_rad(self) -> float:
+        return np.deg2rad(self.fovx_deg)
+
+    @property
+    def fovy_rad(self) -> float:
+        # Derive the vertical FOV from the horizontal one to avoid stretched renders.
+        return 2.0 * np.arctan(np.tan(self.fovx_rad / 2.0) / self.aspect_ratio)
 
 
 @dataclass
@@ -143,8 +155,8 @@ class So101SceneEnv(gym.Env):
         spec = self._camera_spec
         mount = sapien.Entity()
         camera = RenderCameraComponent(spec.width, spec.height)
-        camera.set_fovx(np.deg2rad(spec.fovx_deg), compute_y=False)
-        camera.set_fovy(np.deg2rad(spec.fovy_deg), compute_x=False)
+        camera.set_fovx(spec.fovx_rad, compute_y=False)
+        camera.set_fovy(spec.fovy_rad, compute_x=False)
         camera.near = spec.near
         camera.far = spec.far
         mount.add_component(camera)
