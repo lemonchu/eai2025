@@ -114,18 +114,18 @@ class TableLayout:
             [0, 0, 1],
         ])
         top_mat44[:3, :3] = top_rot
-        top_mat44[:3, 3] = self.table_to_world(52.0, 15.0, cm(10.0))  # adjust numbers or use camera_offset
+        top_mat44[:3, 3] = self.table_to_world(31.6, 26.0, cm(40.7))  # adjust numbers or use camera_offset
         return sapien.Pose(top_mat44)
 
     def side_camera_pose(self) -> sapien.Pose:
         side_mat44 = np.eye(4)
         side_rot = np.array([
-            [0, 1, 0],
-            [-1, 0, 0],
-            [0, 0, 1],
+            [0, 0, -1],
+            [1, 0, 0],
+            [0, -1, 0],
         ])
         side_mat44[:3, :3] = side_rot
-        side_mat44[:3, 3] = self.table_to_world(26.0, 60.0, cm(10.0))  # tune as needed
+        side_mat44[:3, 3] = self.table_to_world(55.0, 20.0, cm(0.0))  # tune as needed
         return sapien.Pose(side_mat44)
 
     def _cluster_properties(self) -> tuple[float, float]:
@@ -206,6 +206,46 @@ class TableLayout:
         Returns a world-coordinate np.ndarray [x,y,z].
         """
         area = str(area).lower()
+        # helper: check overlap between a placed square (center in world meters, half-size in meters, yaw radians)
+        def _overlaps_boundaries(center: np.ndarray, half_m: float, yaw: float) -> bool:
+            # compute 4 corners of the square in world XY
+            corners = np.array([
+                [half_m, half_m],
+                [-half_m, half_m],
+                [-half_m, -half_m],
+                [half_m, -half_m],
+            ])
+            c = np.cos(yaw)
+            s = np.sin(yaw)
+            R = np.array([[c, -s], [s, c]])
+            rotated = (R @ corners.T).T + center[:2]
+            xmin, ymin = rotated[:, 0].min(), rotated[:, 1].min()
+            xmax, ymax = rotated[:, 0].max(), rotated[:, 1].max()
+
+            # boundary line positions in meters
+            y_bands_cm = list(self.horizontal_line_positions())
+            x_bands_cm = list(self.vertical_line_positions())
+            band_half_m = self.boundary_width_m / 2.0
+
+            # Check overlap with vertical bands (lines along Y direction) -> compare X
+            for x_cm in x_bands_cm:
+                x_m = cm(x_cm)
+                band_x_min = x_m - band_half_m
+                band_x_max = x_m + band_half_m
+                # if projected AABB overlaps band in X and spans the table depth, treat as overlap
+                if not (xmax < band_x_min or xmin > band_x_max):
+                    return True
+
+            # Check overlap with horizontal bands (lines along X direction) -> compare Y
+            for y_cm in y_bands_cm:
+                y_m = cm(y_cm)
+                band_y_min = y_m - band_half_m
+                band_y_max = y_m + band_half_m
+                if not (ymax < band_y_min or ymin > band_y_max):
+                    return True
+
+            return False
+
         if area == "robot":
             # Sample within the robot area rectangle (in table coordinates cm)
             robot_areas = self.robot_area_positions()
@@ -217,22 +257,41 @@ class TableLayout:
             # sample within area with a small margin (10% inward)
             margin_x = max(0.1 * w_cm, 0.5)
             margin_y = max(0.1 * d_cm, 0.5)
-            sx_cm = rng.uniform(x0_cm + margin_x, x0_cm + w_cm - margin_x)
-            sy_cm = rng.uniform(y0_cm + margin_y, y0_cm + d_cm - margin_y)
-            world = self.table_to_world(sx_cm, sy_cm, self.table_thickness)
+            max_attempts = 50
+            half_m = cm(1.5)  # default cube half-size ~1.5cm
+            for _ in range(max_attempts):
+                sx_cm = float(rng.uniform(x0_cm + margin_x, x0_cm + w_cm - margin_x))
+                sy_cm = float(rng.uniform(y0_cm + margin_y, y0_cm + d_cm - margin_y))
+                yaw = float(rng.uniform(-np.pi, np.pi))
+                world = self.table_to_world(sx_cm, sy_cm, self.table_thickness)
+                if not _overlaps_boundaries(world, half_m, yaw):
+                    return world
+            # fallback: return last sample even if overlapping
             return world
         # default: sample inside a top bin region
         bin_index = int(np.clip(bin_index, 0, len(self.bin_widths_cm) - 1))
         center_x_cm = self.bin_center_cm(bin_index)
         center_y_cm = self.robot_area_depth_cm + self.bin_band_depth_cm / 2 + self.boundary_width_cm
-        center = self.table_to_world(center_x_cm, center_y_cm, self.table_thickness)
         width_margin = max(self.bin_widths_cm[bin_index] - 2 * self.boundary_width_cm, 1.0)
-        dx = rng.uniform(-cm(width_margin) / 2, cm(width_margin) / 2)
-        dy = rng.uniform(-cm(self.bin_band_depth_cm - 2 * self.boundary_width_cm) / 2,
-                         cm(self.bin_band_depth_cm - 2 * self.boundary_width_cm) / 2)
-        sample = center.copy()
-        sample[1] += dx
-        sample[0] += dy
+        max_attempts = 50
+        half_m = cm(1.5)
+        for _ in range(max_attempts):
+            center = self.table_to_world(center_x_cm, center_y_cm, self.table_thickness)
+            dx = float(rng.uniform(-cm(width_margin) / 2, cm(width_margin) / 2))
+            dy = float(rng.uniform(-cm(self.bin_band_depth_cm - 2 * self.boundary_width_cm) / 2,
+                                   cm(self.bin_band_depth_cm - 2 * self.boundary_width_cm) / 2))
+            sample = center.copy()
+            sample[1] += dx
+            sample[0] += dy
+            yaw = float(rng.uniform(-np.pi, np.pi))
+            # reuse helper defined above to reject overlaps
+            try:
+                overlap = _overlaps_boundaries(sample, half_m, yaw)
+            except Exception:
+                overlap = False
+            if not overlap:
+                return sample
+        # fallback
         return sample
 
     def robot_area_positions(self) -> tuple[tuple[float, float], tuple[float, float]]:
@@ -317,9 +376,9 @@ def spawn_layout(scene: sapien.Scene, layout: TableLayout) -> dict[str, list[sap
         layout.table_depth_cm / 2,
         -0.03,
     )
-    actors["table"].append(
-        _build_box(scene, ground_half, [0.05, 0.05, 0.05], "ground_plane", ground_pose)
-    )
+    # actors["table"].append(
+    #     _build_box(scene, ground_half, [0.05, 0.05, 0.05], "ground_plane", ground_pose)
+    # )
 
     # Create main table surface
     table_half = [layout.table_depth_m / 2, layout.table_width_m / 2, layout.table_thickness / 2]

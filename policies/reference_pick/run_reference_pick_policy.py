@@ -67,15 +67,50 @@ def rollout(args: argparse.Namespace) -> None:
             frame = obs["images"].get("front")
             if frame is not None:
                 save_rgb(frame, episode_dir / "front" / f"frame_{step_idx:04d}.png")
-            if step_idx % 5 == 0:
+            # Save top image: prefer obs images if present, else fallback to take_picture
+            try:
+                top_img = obs["images"].get("top")
+                if top_img is None:
+                    top_img = env.take_picture("top")
+                if top_img is not None:
+                    save_rgb(top_img, episode_dir / "top" / f"frame_{step_idx:04d}.png")
+            except Exception:
+                pass
+
+            # Save side image
+            try:
+                side_img = obs["images"].get("side")
+                if side_img is None:
+                    side_img = env.take_picture("side")
+                if side_img is not None:
+                    save_rgb(side_img, episode_dir / "side" / f"frame_{step_idx:04d}.png")
+            except Exception:
+                pass
+
+            # Save right-side image (now included in obs if env supports it)
+            try:
+                right_img = obs["images"].get("right_side")
+                if right_img is None:
+                    # fallback to env.take_picture
+                    try:
+                        right_img = env.take_picture("right_side")
+                    except Exception:
+                        right_img = None
+                if right_img is not None:
+                    save_rgb(right_img, episode_dir / "right_side" / f"frame_{step_idx:04d}.png")
+            except Exception:
+                pass
+            if step_idx % 1 == 0:
+                lift = info.get("max_lift", np.nan)
                 distance = info.get("distance", np.nan)
+                gripped = info.get("gripped", False)
                 print(
-                    f"  step={step_idx:<4} stage={policy.current_stage:<8} reward={reward: .3f} dist={distance: .3f}"
+                    f"  step={step_idx:<4} stage={policy.current_stage:<8} reward={reward: .3f} dist={distance: .3f} lift={lift: .3f} m gripped={bool(gripped)}"
                 )
             done = terminated or truncated
             step_idx += 1
         print(
-            f"Episode {episode} -> success={info.get('success', False)} distance={info.get('distance', np.nan):.3f} steps={step_idx}"
+            f"Episode {episode} -> success={info.get('success', False)} max_lift={info.get('max_lift', np.nan):.3f} m gripped={info.get('gripped', False)} steps={step_idx}"
         )
     env.close()
 

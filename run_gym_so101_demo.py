@@ -13,9 +13,12 @@ def main():
 	obs, info = env.reset()
 	print("obs_compat:", env.unwrapped.get_obs_compat())
 	rgba = env.unwrapped.take_picture("front")
+	rgba_side = env.unwrapped.take_picture("right_side")
 	out = f"front_view_{args.task}.png"
+	out_side = f"right_side_view_{args.task}.png"
 	Image.fromarray(rgba).save(out)
-	print("Saved", out)
+	Image.fromarray(rgba_side).save(out_side)
+	print("Saved", out, "and", out_side)
 	print("Success:", env.unwrapped.check_success())
 	env.close()
 

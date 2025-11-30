@@ -109,7 +109,7 @@ class So101SceneEnv(gym.Env):
             # Fixed paths under the scene assets directory: ./textures
             # Get current folder   
             current_folder = Path(__file__).parent
-            albedo_path =  current_folder / "textures/tiles.png"
+            albedo_path =  current_folder / "textures/ground_texture2.jpg"
             roughness_path = current_folder / "textures/ground_texture.jpg"
             print("Loading ground textures from:", albedo_path, roughness_path)
 
@@ -123,7 +123,7 @@ class So101SceneEnv(gym.Env):
                     arr = np.asarray(img).astype(np.float32) / 255.0
                     avg = arr.mean(axis=(0, 1))
                     base_color = np.array([avg[0], avg[1], avg[2], 1.0], dtype=np.float32)
-                    
+                    print('Loaded ground albedo average color:', base_color)
                 except Exception:
                     pass
 
@@ -132,6 +132,7 @@ class So101SceneEnv(gym.Env):
                     rimg = Image.open(roughness_path).convert("L")
                     rarr = np.asarray(rimg).astype(np.float32) / 255.0
                     roughness_val = float(rarr.mean())
+                    print('Loaded ground roughness average value:', roughness_val)
                 except Exception:
                     pass
 
@@ -147,8 +148,9 @@ class So101SceneEnv(gym.Env):
             except Exception:
                 pass
             self.scene.add_ground(-1, render_material=ground_material)
-        except Exception:
+        except Exception as e:
             # Fallback to default ground if RenderMaterial isn't available in this build
+            print(e)
             self.scene.add_ground(-1)
 
         # Softer ambient light with a slight cool tint to avoid a pure-white background
@@ -284,6 +286,57 @@ class So101SceneEnv(gym.Env):
                 near=spec.near,
                 far=spec.far,
             )
+            # Also add an additional right-side camera positioned a bit further right
+            try:
+                # copy pose and offset slightly in +X (world) to move further to the right
+                side_pose_right = self._layout.side_camera_pose()
+                try:
+                    pos = np.array(side_pose_right.p)
+                    quat = np.array(side_pose_right.q) if hasattr(side_pose_right, "q") else None
+                except Exception as e:
+                    pos = np.zeros(3)
+                    quat = None
+                pos_right = pos
+
+                # Apply a small downward pitch to the right-side camera so it looks
+                # roughly horizontal or slightly downward onto the table.
+                # We'll create a pitch quaternion (rotation about local X) and
+                # multiply it with the existing pose quaternion (if present).
+                def _quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+                    # a and b are [w, x, y, z]
+                    aw, ax, ay, az = a
+                    bw, bx, by, bz = b
+                    return np.array([
+                        aw * bw - ax * bx - ay * by - az * bz,
+                        aw * bx + ax * bw + ay * bz - az * by,
+                        aw * by - ax * bz + ay * bw + az * bx,
+                        aw * bz + ax * by - ay * bx + az * bw,
+                    ], dtype=float)
+
+                pitch = 0
+                half = float(np.cos(pitch / 2.0))
+                sin_half = float(np.sin(pitch / 2.0))
+                q_pitch = np.array([half, 0.0, 0.0, sin_half], dtype=float)
+                if quat is None:
+                    q_world = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+                else:
+                    q_world = quat.astype(float)
+                q_new = _quat_mul(q_world, q_pitch)
+                right_pose = sapien.Pose(pos_right, q_new)
+                self._right_side_camera = self.scene.add_mounted_camera(
+                    name="right_side_camera",
+                    mount=mount,
+                    pose=right_pose,
+                    width=spec.width,
+                    height=spec.height,
+                    fovy=np.deg2rad(73.63),
+                    near=spec.near,
+                    far=spec.far,
+                )
+                self._sensors["right_side"] = self._right_side_camera
+            except Exception:
+                # If creating the extra camera fails, continue without it
+                pass
             self._sensors["top"] = self._top_camera
             self._sensors["side"] = self._side_camera
         except Exception:
@@ -310,6 +363,8 @@ class So101SceneEnv(gym.Env):
         image_spaces = {
             "front": spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8),
         }
+        # include right-side camera image if present
+        image_spaces["right_side"] = spaces.Box(low=0, high=255, shape=image_shape, dtype=np.uint8)
         for arm in self._arms:
             image_spaces[f"{arm.name}_wrist"] = spaces.Box(
                 low=0, high=255, shape=image_shape, dtype=np.uint8
@@ -458,40 +513,96 @@ class So101SceneEnv(gym.Env):
         self.scene.update_render()
         obs = self._get_observation()
         reward = self._compute_reward()
-        success = self._last_distance < self._success_radius
+        # Success criterion: object lifted by at least configured threshold.
+        # Prefer explicit physics/pose-based check rather than proximity.
+        success = self.check_success()
         self._step_count += 1
         terminated = success
         truncated = self._step_count >= self._max_episode_steps
-        info = {"success": success, "distance": self._last_distance}
+        # Report object lift heights for easier debugging/metrics
+        max_lift = float(0.0)
+        lifts = []
+        for a in getattr(self, "_task_objects", []):
+            try:
+                p = np.array(a.get_pose().p)
+                lift_h = float(p[2] - self._object_half - self._layout.table_surface_z)
+                lifts.append(lift_h)
+            except Exception:
+                continue
+        if lifts:
+            max_lift = float(max(lifts))
+        # Include gripped flag (set by _compute_reward)
+        gripped = bool(getattr(self, "_last_gripped", False))
+        info = {"success": success, "distance": self._last_distance, "max_lift": max_lift, "gripped": gripped}
         if self._viewer is not None:
             self._viewer.render()
         return obs, reward, terminated, truncated, info
 
     def _compute_reward(self) -> float:
-        # compute min distance from any arm end-effector to any spawned task object
-        object_positions = []
+        # Reward based on object lift above the table surface (meters), plus a grasp bonus.
+        # We still compute and update `self._last_distance` for compatibility/debug info.
+        max_lift = 0.0
+        object_positions: list[np.ndarray] = []
         for a in getattr(self, "_task_objects", []):
             try:
-                object_positions.append(np.array(a.get_pose().p))
+                p = np.array(a.get_pose().p)
+                lift_h = float(p[2] - self._object_half - self._layout.table_surface_z)
+                object_positions.append(p)
+                if lift_h > max_lift:
+                    max_lift = lift_h
             except Exception:
                 pass
-        if not object_positions:
-            self._last_distance = 1e6
-            return -self._last_distance
-        distances = []
+
+        # Update last_distance for compatibility/logging (min distance from any eef to any object)
+        distances: list[float] = []
         for arm in self._arms:
-            eef_pos = np.array(arm.eef_link.get_pose().p)
-            for obj_pos in object_positions:
-                distances.append(np.linalg.norm(eef_pos - obj_pos))
-        self._last_distance = float(min(distances))
-        shaped = -self._last_distance
-        if self._last_distance < self._success_radius:
-            shaped += 1.0
-        return shaped
+            try:
+                eef_pos = np.array(arm.eef_link.get_pose().p)
+                for obj_pos in object_positions:
+                    distances.append(float(np.linalg.norm(eef_pos - obj_pos)))
+            except Exception:
+                continue
+        if distances:
+            self._last_distance = float(min(distances))
+        else:
+            self._last_distance = 1e6
+
+        # Detect a simple approximate grasp: gripper joint closed AND eef close to an object.
+        gripped = False
+        grasp_distance_thresh = 0.02  # meters
+        gripper_closed_thresh = 0.0   # values <= this are considered 'closed'
+        for arm in self._arms:
+            try:
+                qpos = arm.robot.get_qpos()
+                gripper_val = float(qpos[arm.joint_indices[-1]])
+                if gripper_val <= gripper_closed_thresh:
+                    eef_pos = np.array(arm.eef_link.get_pose().p)
+                    for obj_pos in object_positions:
+                        if float(np.linalg.norm(eef_pos - obj_pos)) <= grasp_distance_thresh:
+                            gripped = True
+                            break
+                if gripped:
+                    break
+            except Exception:
+                continue
+
+        # Store last gripped state for info reporting
+        self._last_gripped = bool(gripped)
+
+        # Shaped reward: proportional to lift (meters), non-negative, plus bonuses
+        reward = float(max(0.0, max_lift))
+        if max_lift >= 0.05:
+            reward += 1.0
+        if gripped:
+            # Encourage establishing a grasp (smaller bonus than successful lift)
+            reward += 0.5
+        return reward
 
     def _get_observation(self) -> dict[str, Any]:
-        front, wrist_frames = self._render_cameras()
+        front, wrist_frames, right = self._render_cameras()
         images: dict[str, np.ndarray] = {"front": front}
+        # include right-side view
+        images["right_side"] = right.copy() if isinstance(right, np.ndarray) else right
         state_dict: dict[str, np.ndarray] = {}
         for arm in self._arms:
             wrist_key = f"{arm.name}_wrist"
@@ -513,7 +624,26 @@ class So101SceneEnv(gym.Env):
             color = camera.get_picture("Color")
             self._wrist_rgbs[name] = self._float_to_uint8(color)
             wrist_frames[f"{name}_wrist"] = self._wrist_rgbs[name].copy()
-        return self._front_rgb.copy(), wrist_frames
+        # Right-side camera (mounted) if available
+        right_rgb = None
+        try:
+            if hasattr(self, "_right_side_camera") and self._right_side_camera is not None:
+                # mounted_camera object
+                self._right_side_camera.take_picture()
+                rcolor = self._right_side_camera.get_picture("Color")
+                # convert to uint8
+                right_rgb = self._float_to_uint8(rcolor)
+        except Exception:
+            right_rgb = None
+
+        if right_rgb is None:
+            # fallback to an empty image with same shape as front
+            try:
+                right_rgb = np.zeros_like(self._front_rgb)
+            except Exception:
+                right_rgb = np.zeros((self._camera_spec.height, self._camera_spec.width, 3), dtype=np.uint8)
+
+        return self._front_rgb.copy(), wrist_frames, right_rgb
 
     @staticmethod
     def _float_to_uint8(rgba: np.ndarray) -> np.ndarray:
@@ -524,7 +654,7 @@ class So101SceneEnv(gym.Env):
         if self._render_mode != "rgb_array":
             raise NotImplementedError("Only rgb_array render mode is supported in headless mode")
         self.scene.update_render()
-        frame, _ = self._render_cameras()
+        frame, _, _ = self._render_cameras()
         return frame
 
     def close(self) -> None:

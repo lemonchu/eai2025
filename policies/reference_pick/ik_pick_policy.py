@@ -47,12 +47,15 @@ class IKPickPolicy:
         self,
         env,
         arm_name: str = "right",
-        approach_height: float = 0.18,
+        approach_height: float = 0.00,
         descend_offset: float = 0.01,
         lift_height: float = 0.20,
         tolerance: float = 0.03,
         gripper_open: float = 0.6,
         gripper_close: float = -0.1,
+        grip_close_threshold: float = 0.035,
+        grip_close_xy: float = 0.1, # Placeholder, set to 0.1 to ensure robot arm is moving
+        grip_close_z: float = 0.1,
     ) -> None:
         self.env = env
         self.arm_name = arm_name
@@ -62,6 +65,9 @@ class IKPickPolicy:
         self.tolerance = tolerance
         self.gripper_open = gripper_open
         self.gripper_close = gripper_close
+        self.grip_close_threshold = grip_close_threshold
+        self.grip_close_xy = grip_close_xy
+        self.grip_close_z = grip_close_z
         self._stages: List[JointStage] = []
         self._stage_idx = 0
         self._cached_zero: np.ndarray | None = None
@@ -109,10 +115,101 @@ class IKPickPolicy:
         start = self.arm_index * self.dof_per_arm
         stop = start + self.dof_per_arm
         action[start:stop] = delta
-        # Override gripper entry explicitly
-        action[stop - 1] = np.clip(stage.gripper_target - joints[-1], -self.action_scale, self.action_scale)
-        if np.linalg.norm(joints - stage.joint_targets) < self.tolerance:
-            self._stage_idx += 1
+        # Decide gripper command: only close when the EEF is near the cube
+        desired_gripper = stage.gripper_target
+        if stage.name == "grip":
+            # get current cube position
+            cube_pos = None
+            try:
+                if hasattr(self, "_current_cube_pos") and self._current_cube_pos is not None:
+                    cube_pos = self._current_cube_pos
+                else:
+                    unwrapped = self.env.unwrapped
+                    cube = getattr(unwrapped, "_task_objects", [None])[0]
+                    if cube is not None:
+                        cube_pos = np.array(cube.get_pose().p, dtype=np.float32)
+            except Exception:
+                cube_pos = None
+            try:
+                eef_pos = np.array(self.arm.eef_link.get_pose().p)
+            except Exception:
+                eef_pos = None
+            if cube_pos is None or eef_pos is None:
+                # fallback to radial distance if we can't get both positions
+                try:
+                    if eef_pos is not None and cube_pos is not None:
+                        dist = float(np.linalg.norm(eef_pos - cube_pos))
+                    else:
+                        dist = float("inf")
+                except Exception:
+                    dist = float("inf")
+                if dist > float(self.grip_close_threshold):
+                    desired_gripper = self.gripper_open
+                    print(f"[GRIP-GATE] stage=grip eef_dist={dist:.4f} > {self.grip_close_threshold:.3f}; keeping gripper open")
+                    print(
+                        f"[GRIP-DIAG] eef={None if eef_pos is None else eef_pos.tolist()} cube={None if cube_pos is None else cube_pos.tolist()} "
+                        f"gripper_current={joints[-1]:.4f} planned_close={stage.gripper_target:.4f} desired={desired_gripper:.4f}"
+                    )
+                else:
+                    print(f"[GRIP-GATE] stage=grip eef_dist={dist:.4f} <= {self.grip_close_threshold:.3f}; allowing close")
+                    print(
+                        f"[GRIP-DIAG] eef={None if eef_pos is None else eef_pos.tolist()} cube={None if cube_pos is None else cube_pos.tolist()} "
+                        f"gripper_current={joints[-1]:.4f} planned_close={stage.gripper_target:.4f} desired={desired_gripper:.4f}"
+                    )
+            else:
+                # compute planar and vertical separation
+                eef_xy = np.asarray(eef_pos[:2], dtype=np.float32)
+                cube_xy = np.asarray(cube_pos[:2], dtype=np.float32)
+                planar = float(np.linalg.norm(eef_xy - cube_xy))
+                vertical = float(abs(float(eef_pos[2]) - float(cube_pos[2])))
+                xy_ok = planar <= float(self.grip_close_xy)
+                z_ok = vertical <= float(self.grip_close_z)
+                if not (xy_ok and z_ok):
+                    desired_gripper = self.gripper_open
+                    print(
+                        f"[GRIP-GATE] stage=grip planar={planar:.4f} (thr={self.grip_close_xy:.3f}) vertical={vertical:.4f} (thr={self.grip_close_z:.3f}) -> keeping gripper open"
+                    )
+                    print(
+                        f"[GRIP-DIAG] eef={eef_pos.tolist()} cube={cube_pos.tolist()} "
+                        f"gripper_current={joints[-1]:.4f} planned_close={stage.gripper_target:.4f} desired={desired_gripper:.4f}"
+                    )
+                else:
+                    print(
+                        f"[GRIP-GATE] stage=grip planar={planar:.4f} vertical={vertical:.4f} -> allowing close"
+                    )
+                    print(
+                        f"[GRIP-DIAG] eef={eef_pos.tolist()} cube={cube_pos.tolist()} "
+                        f"gripper_current={joints[-1]:.4f} planned_close={stage.gripper_target:.4f} desired={desired_gripper:.4f}"
+                    )
+
+        # Override gripper entry explicitly (use desired_gripper)
+        gripper_action = np.clip(desired_gripper - joints[-1], -self.action_scale, self.action_scale)
+        action[stop - 1] = gripper_action
+        if stage.name == "grip":
+            print(f"[GRIP-ACTION] value={gripper_action:.6f} desired_gripper={desired_gripper:.4f} current={joints[-1]:.4f}")
+
+        # For progress checking, use a temporary joint-target vector that
+        # reflects the desired_gripper (so gating doesn't wait for a target
+        # we're intentionally not commanding yet).
+        progress_targets = stage.joint_targets.copy()
+        try:
+            progress_targets[-1] = desired_gripper
+        except Exception:
+            pass
+
+        # Advance stage only when joint-space target (including gripper) is reached
+        progress_ok = np.linalg.norm(joints - progress_targets) < self.tolerance
+        if stage.name == "grip" and desired_gripper != stage.gripper_target:
+            # We are intentionally gating the gripper open; do not advance
+            # to the next stage even if other joints match their targets.
+            if progress_ok:
+                print(
+                    f"[GRIP-PROGRESS-BLOCKED] joints match progress targets but gripper gated open;"
+                    f" eef_dist_block={self.grip_close_threshold:.4f}"
+                )
+        else:
+            if progress_ok:
+                self._stage_idx += 1
         return action
 
     def _plan_stages(self) -> None:
@@ -127,7 +224,13 @@ class IKPickPolicy:
         yaw = _yaw_from_quat(cube_quat)
         # Look straight down, rotate closing axis with cube yaw
         downward = np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32)
-        orientation = _quat_multiply(_quat_from_yaw(yaw), downward)
+        default_down_orientation = _quat_multiply(_quat_from_yaw(yaw), downward)
+        # capture current EEF orientation so the approach stage can keep it
+        try:
+            current_eef_pose = self.arm.eef_link.get_pose()
+            current_eef_q = np.array(current_eef_pose.q, dtype=np.float32)
+        except Exception:
+            current_eef_q = default_down_orientation
 
         base_qpos = self.arm.robot.get_qpos().copy()
         current = base_qpos[self.arm.joint_indices]
@@ -147,8 +250,19 @@ class IKPickPolicy:
         ]
 
         last_full = base_qpos
+        q_yaw = _quat_from_yaw(yaw)
         for name, target_pos, grip in stages:
-            target_pose = sapien.Pose(target_pos, orientation.tolist())
+            # choose per-stage orientation:
+            # - approach: yaw-only (align yaw with cube, allow free pitch/roll)
+            # - descend/grip: downward-facing orientation for reliable grasp
+            # - others: keep current EEF orientation
+            if name == "approach":
+                orientation_stage = q_yaw
+            elif name in ("descend", "grip"):
+                orientation_stage = default_down_orientation
+            else:
+                orientation_stage = current_eef_q
+            target_pose = sapien.Pose(target_pos, orientation_stage.tolist())
             joint_targets = self._solve_ik(target_pose, last_full) or current
             joint_targets = joint_targets.astype(np.float32)
             joint_targets[-1] = grip
