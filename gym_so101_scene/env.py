@@ -106,9 +106,7 @@ class So101SceneEnv(gym.Env):
         try:
             ground_material = sapien.render.RenderMaterial()
             # Try to load ground albedo and roughness maps from the scene assets directory.
-            # Fixed paths under the scene assets directory:
-            #   ./ground_albedo.png
-            #   ./ground_roughness.png
+            # Fixed paths under the scene assets directory: ./textures
             # Get current folder   
             current_folder = Path(__file__).parent
             albedo_path =  current_folder / "textures/tiles.png"
@@ -125,6 +123,7 @@ class So101SceneEnv(gym.Env):
                     arr = np.asarray(img).astype(np.float32) / 255.0
                     avg = arr.mean(axis=(0, 1))
                     base_color = np.array([avg[0], avg[1], avg[2], 1.0], dtype=np.float32)
+                    
                 except Exception:
                     pass
 

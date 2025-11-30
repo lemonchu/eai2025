@@ -10,4 +10,11 @@ register(
     max_episode_steps=300,
 )
 
+# Also register the namespaced ID expected by LeRobot configs
+register(
+    id="gym_so101_scene/ScenePickCube-v0",
+    entry_point="gym_so101_scene.env:So101SceneEnv",
+    max_episode_steps=300,
+)
+
 __all__ = ["So101SceneEnv"]

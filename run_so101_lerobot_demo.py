@@ -10,16 +10,13 @@ import numpy as np
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-PARENT_ROOT = PROJECT_ROOT.parent
-LEROBOT_SRC = PARENT_ROOT / "lerobot" / "src"
-if LEROBOT_SRC.exists() and str(LEROBOT_SRC) not in sys.path:
-    sys.path.insert(0, str(LEROBOT_SRC))
+# Local assets live under eai2025/scene/assets/SO101 as provided by the TAs.
+DEFAULT_SCENE_ROOT = PROJECT_ROOT / "scene" / "assets" / "SO101"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 import gym_so101_scene  # noqa: F401
-from lerobot.envs.factory import make_env_config
 
 
 def save_rgb(frame: np.ndarray, path: Path) -> None:
@@ -27,20 +24,26 @@ def save_rgb(frame: np.ndarray, path: Path) -> None:
     Image.fromarray(frame).save(path)
 
 
+def _resolve_scene_root(scene_root: str | None) -> Path:
+    if scene_root:
+        root = Path(scene_root).expanduser().resolve()
+    else:
+        root = DEFAULT_SCENE_ROOT
+    if not root.exists():
+        raise FileNotFoundError(f"SO-101 assets not found at {root}")
+    return root
+
+
 def rollout(args: argparse.Namespace) -> None:
-    scene_root = Path(args.scene_root).resolve() if args.scene_root else None
-    cfg = make_env_config(
-        "so101_scene",
-        task="ScenePickCube-v0",
-        scene_root=str(scene_root) if scene_root else None,
+    scene_root = _resolve_scene_root(args.scene_root)
+    env = gym.make(
+        "gym_so101_scene/ScenePickCube-v0",
+        task=args.task,
+        scene_root=str(scene_root),
         render_mode="rgb_array",
         headless=not args.show_viewer,
         max_episode_steps=args.max_steps,
     )
-    # Pass through the simple `task` argument to the underlying env constructor
-    cfg.gym_kwargs = dict(cfg.gym_kwargs)
-    cfg.gym_kwargs["task"] = args.task
-    env = gym.make(cfg.gym_id, **cfg.gym_kwargs)
     record_root = Path(args.record_dir).resolve()
     record_root.mkdir(parents=True, exist_ok=True)
     for episode in range(args.episodes):
@@ -69,7 +72,7 @@ def rollout(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the SO-101 Sapien scene via LeRobot config")
+    parser = argparse.ArgumentParser(description="Run the SO-101 Sapien scene using local assets")
     parser.add_argument("--episodes", type=int, default=2, help="Number of episodes to roll out")
     parser.add_argument("--max-steps", type=int, default=200, help="Max steps per episode")
     parser.add_argument("--record-dir", type=str, default="outputs/so101_demo", help="Directory for saved frames")

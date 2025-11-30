@@ -1,6 +1,6 @@
 # EAI Track 1 Environment Setup
 
-This guide walks you through preparing a headless Linux server for Track 1 experiments using LeRobot + ManiSkill (SO-100/101 reference) + Gym-style tooling. Commands assume Ubuntu 20.04+/22.04+ with bash and sudo access.
+This guide walks you through preparing a headless Linux server for Track 1 experiments using the TA-provided SO-101 assets plus ManiSkill/Gym tooling. Commands assume Ubuntu 20.04+/22.04+ with bash and sudo access.
 
 ## 1. System Requirements
 
@@ -38,22 +38,7 @@ pip install "mani-skill>=3.0.0" imageio[ffmpeg] opencv-python
 
 If PyPI is slow, append `-i https://pypi.tuna.tsinghua.edu.cn/simple`.
 
-## 4. Install LeRobot from Source
-
-```bash
-cd /cephfs/hp/cm_projects/eai/lerobot
-pip install -r requirements-ubuntu.txt  # optional but recommended for binary deps
-pip install -e ".[dev]"
-```
-
-Running the test shim once helps confirm the install:
-
-```bash
-cd /cephfs/hp/cm_projects/eai/lerobot
-pytest tests/test_available.py
-```
-
-## 5. Install Gym / Gymnasium Tooling
+## 4. Install Gym / Gymnasium Tooling
 
 ```bash
 pip install "gymnasium[classic-control]" "gym==0.26.2" matplotlib
@@ -61,9 +46,9 @@ pip install "gymnasium[classic-control]" "gym==0.26.2" matplotlib
 
 The dual install keeps compatibility with older configs that still import `gym`.
 
-## 6. Quick Sanity Checks
+## 5. Quick Sanity Checks
 
-### 6.1 Gym CartPole (CPU-only)
+### 5.1 Gym CartPole (CPU-only)
 
 ```bash
 python - <<'PY'
@@ -80,7 +65,7 @@ print("Gym CartPole OK")
 PY
 ```
 
-### 6.2 ManiSkill PickCube Headless
+### 5.2 ManiSkill PickCube Headless
 
 ```bash
 python - <<'PY'
@@ -103,7 +88,7 @@ print("ManiSkill PickCube headless OK")
 PY
 ```
 
-## 7. (Optional) Generate a Reference Video
+## 6. (Optional) Generate a Reference Video
 
 Use `gen_so100_video.py` at the repository root to confirm RGB rendering:
 
@@ -115,13 +100,13 @@ python gen_so100_video.py
 
 It produces `so100_pickcube_demo.mp4`. Inspect the clip to ensure the SO-100 pick-and-place scene matches expectations.
 
-## 8. Next Steps
+## 7. Next Steps
 
-- Plug in your datasets under `dataset/eai/*` using LeRobot processors.
-- Adapt ManiSkill’s SO-100 task description to SO-101 by swapping URDF/SRDF files in `announce/assets/SO101/`.
-- Version-control any new scripts (env wrappers, training configs) under `lerobot/examples/` or a dedicated experiments folder.
+- Plug in your datasets under `dataset/eai/*` using your preferred processors.
+- Extend ManiSkill’s SO-100 task description to SO-101 by swapping URDF/SRDF files inside `scene/assets/SO101/`.
+- Version-control any new scripts (env wrappers, training configs) under `policies/` or another folder in this repository so everything stays self-contained.
 
-## 9. Laptop (With Display) Tips
+## 8. Laptop (With Display) Tips
 
 If you want to run the same stack on a personal laptop for debugging or visualization:
 
