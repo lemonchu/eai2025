@@ -12,6 +12,7 @@ from gymnasium import spaces
 from sapien.render import RenderCameraComponent
 
 from .layout import TableLayout, spawn_layout
+from .tasks import PickCubeTask, PickCubeTaskConfig
 
 
 # CameraSpec: width/height/fovy
@@ -97,9 +98,18 @@ class So101SceneEnv(gym.Env):
         ]
         self._initial_joint_positions = np.array([0.0, -0.4, 0.7, 0.4, 0.0, 0.4], dtype=np.float32)
         self._arms: list[ArmInterface] = []
+        self._pick_cube_task: PickCubeTask | None = None
+        self._last_task_info: dict[str, Any] = {}
         self._setup_scene()
         self._setup_robots()
         self._setup_cameras()
+        if (self._task or "").lower() == "pick_cube":
+            self._pick_cube_task = PickCubeTask(
+                scene=self.scene,
+                layout=self._layout,
+                rng=self._rng,
+                config=PickCubeTaskConfig(),
+            )
         self._setup_objects()
         self._define_spaces()
         self._last_distance = 1e6
@@ -428,6 +438,7 @@ class So101SceneEnv(gym.Env):
         if seed is not None:
             self.seed(seed)
         self._step_count = 0
+        self._last_task_info = {}
         self._reset_robot_state()
         # Clear and spawn task-specific objects (if any)
         self._clear_task_objects()
@@ -451,6 +462,8 @@ class So101SceneEnv(gym.Env):
         return
 
     def _clear_task_objects(self) -> None:
+        if self._pick_cube_task is not None:
+            self._pick_cube_task.clear()
         for a in list(getattr(self, "_task_objects", []) or []):
             try:
                 if hasattr(a, "release"):
@@ -469,6 +482,9 @@ class So101SceneEnv(gym.Env):
         - 'stack': two cubes (red bottom, green top) stacked in the right robot area
         - 'sort': two cubes (red, green) in the center bin area
         """
+        if self._pick_cube_task is not None:
+            self._task_objects = list(self._pick_cube_task.spawn())
+            return
         task = (self._task or "lift").lower()
         half = self._object_half
         # helper to build a colored cube (static) with an optional yaw rotation around Z
@@ -557,6 +573,8 @@ class So101SceneEnv(gym.Env):
         # Include gripped flag (set by _compute_reward)
         gripped = bool(getattr(self, "_last_gripped", False))
         info = {"success": success, "distance": self._last_distance, "max_lift": max_lift, "gripped": gripped}
+        if self._last_task_info:
+            info.update(self._last_task_info)
         if self._viewer is not None:
             self._viewer.render()
         return obs, reward, terminated, truncated, info
@@ -564,6 +582,15 @@ class So101SceneEnv(gym.Env):
     def _compute_reward(self) -> float:
         # Reward based on object lift above the table surface (meters), plus a grasp bonus.
         # We still compute and update `self._last_distance` for compatibility/debug info.
+        if self._pick_cube_task is not None:
+            reward, metrics = self._pick_cube_task.compute_reward(self._arms)
+            self._last_task_info = metrics.copy()
+            if "distance" in metrics:
+                self._last_distance = float(metrics["distance"])
+            self._last_gripped = bool(metrics.get("is_grasped", False))
+            return reward
+
+        self._last_task_info = {}
         max_lift = 0.0
         object_positions: list[np.ndarray] = []
         for a in getattr(self, "_task_objects", []):
@@ -742,6 +769,8 @@ class So101SceneEnv(gym.Env):
         return {"qpos": qpos, "cube_pos": cube_pos, "cube_quat": cube_quat}
 
     def check_success(self) -> bool:
+        if self._pick_cube_task is not None:
+            return self._pick_cube_task.check_success()
         for a in getattr(self, "_task_objects", []):
             try:
                 p = np.array(a.get_pose().p, dtype=np.float32).flatten()

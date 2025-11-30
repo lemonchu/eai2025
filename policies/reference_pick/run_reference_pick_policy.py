@@ -121,7 +121,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=220, help="Max steps per episode")
     parser.add_argument("--record-dir", type=str, default="outputs/reference_pick", help="Directory for saved frames")
     parser.add_argument("--scene-root", type=str, default=None, help="Override path to SO-101 assets")
-    parser.add_argument("--task", type=str, default="lift", help="Task to spawn: lift|stack|sort")
+    parser.add_argument("--task", type=str, default="pick_cube", help="Task to spawn: lift|stack|sort|pick_cube")
     parser.add_argument("--arm", type=str, default="right", help="Arm to control (left|right)")
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed")
     parser.add_argument("--show-viewer", action="store_true", help="Open the Sapien viewer (requires GUI)")
