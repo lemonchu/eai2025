@@ -65,11 +65,17 @@ class So101SceneEnv(gym.Env):
         super().__init__()
         self._render_mode = render_mode
         self._headless = headless
-        self._scene_root = (
-            Path(scene_root)
-            if scene_root is not None
-            else Path(__file__).resolve().parents[2] / "scene" / "assets" / "SO101"
-        )
+        if scene_root is not None:
+            self._scene_root = Path(scene_root)
+        else:
+            assets_root = Path(__file__).resolve().parents[2] / "scene" / "assets"
+            candidate = assets_root / "SO101"
+            if not candidate.exists():
+                raise FileNotFoundError(
+                    "Unable to locate SO-101 assets. Provide scene_root or place the assets "
+                    "under scene/assets/SO101."
+                )
+            self._scene_root = candidate
         self._max_episode_steps = max_episode_steps
         self._action_scale = action_scale
         self._success_radius = success_radius
@@ -211,8 +217,25 @@ class So101SceneEnv(gym.Env):
         limits = [joints[name].get_limits()[0] for name in self._controlled_joint_names]
         lower = np.array([limit[0] for limit in limits], dtype=np.float32)
         upper = np.array([limit[1] for limit in limits], dtype=np.float32)
-        eef_link = next(link for link in robot.get_links() if link.name == "gripper_frame_link")
-        camera_link = next(link for link in robot.get_links() if "camera_link" in link.name)
+
+        links = {link.name: link for link in robot.get_links()}
+        eef_candidates = (
+            "gripper_frame_link",  # legacy SO101 URDF
+            "gripper_link_tip",  # helper link exposed by the new SO101 URDF
+            "moving_jaw_so101_v1_link_tip",
+            "gripper_link",  # final fallback so the env at least loads
+        )
+        eef_link = next((links[name] for name in eef_candidates if name in links), None)
+        if eef_link is None:
+            available = ", ".join(sorted(links.keys()))
+            raise RuntimeError(
+                "Failed to locate an end-effector link in URDF. "
+                f"Looked for {eef_candidates}, available links: {available}"
+            )
+
+        camera_link = next((links[name] for name in links if "camera_link" in name), None)
+        if camera_link is None:
+            raise RuntimeError("SO-101 URDF is missing a camera_link for the wrist camera mount")
         return ArmInterface(
             name=label,
             robot=robot,

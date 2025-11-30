@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-# Local assets live under eai2025/scene/assets/SO101 as provided by the TAs.
+# Official SO-101 assets now live under scene/assets/SO101 (updated URDF).
 DEFAULT_SCENE_ROOT = PROJECT_ROOT / "scene" / "assets" / "SO101"
 
 if str(PROJECT_ROOT) not in sys.path:
@@ -27,11 +27,16 @@ def save_rgb(frame: np.ndarray, path: Path) -> None:
 def _resolve_scene_root(scene_root: str | None) -> Path:
     if scene_root:
         root = Path(scene_root).expanduser().resolve()
-    else:
-        root = DEFAULT_SCENE_ROOT
-    if not root.exists():
-        raise FileNotFoundError(f"SO-101 assets not found at {root}")
-    return root
+        if not root.exists():
+            raise FileNotFoundError(f"SO-101 assets not found at {root}")
+        return root
+
+    if DEFAULT_SCENE_ROOT.exists():
+        return DEFAULT_SCENE_ROOT
+    raise FileNotFoundError(
+        "Unable to locate SO-101 assets under scene/assets/SO101. "
+        "Pass --scene-root to point to a custom directory or ensure the assets are installed."
+    )
 
 
 def rollout(args: argparse.Namespace) -> None:
